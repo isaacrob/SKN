@@ -1,21 +1,35 @@
 from sklearn.base import BaseEstimator
-from sklearn.metrics import normalized_mutual_info_score, mutual_info_score, silhouette_score
+from sklearn.metrics import normalized_mutual_info_score, mutual_info_score, silhouette_score, davies_bouldin_score, calinski_harabasz_score, v_measure_score, adjusted_mutual_info_score, log_loss
 from sklearn.metrics.pairwise import pairwise_distances
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn import linear_model, naive_bayes
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, cross_val_score
 from scipy.linalg import eigh
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import entropy as get_entropy
 import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader, ConcatDataset
+from torch.nn.utils.rnn import pad_sequence
 import progressbar
 import copy
+import matplotlib.pyplot as plt
+import shap
+import contextlib
+import sys
+from collections import defaultdict, Counter
 
 from models import *
 from losses import f_loss, reg_betainc
 from plots import plot_2d
+
+
+simple_classifier = linear_model.LogisticRegression(solver = 'lbfgs', n_jobs = -1)
+
 
 def change_cluster_labels_to_sequential(clusters):
     labels = np.unique(clusters)
@@ -59,6 +73,17 @@ def tokens_to_tfidf(x):
 
     return out
 
+class DummyFile(object):
+    def write(self, x): pass
+    def flush(self): pass
+
+@contextlib.contextmanager
+def nostdout():
+    save_stdout = sys.stdout
+    sys.stdout = DummyFile()
+    yield
+    sys.stdout = save_stdout
+
 class SKN(BaseEstimator):
     def __init__(
         self,
@@ -72,7 +97,7 @@ class SKN(BaseEstimator):
         metric = 'euclidean',
         neighbors_preprocess = None,
         use_gpu = True,
-        learning_rate = 1e-3,
+        learning_rate = 5e-4,
         optimizer_override = None,
         epochs = 10,
         verbose_level = 1,
@@ -82,12 +107,21 @@ class SKN(BaseEstimator):
         cluster_subnet_dropout_p = .3,
         is_tokens = False,
         cluster_subsample_n = 1000,
-        zero_cutoff = 1e-2,
+        initial_zero_cutoff = 1e-2,
+        minimum_zero_cutoff = 1e-7,
+        update_zero_cutoff = False,
         internal_dim = 64,
         cluster_subnet_training_epochs = 50,
         semisupervised_weight = None,
-        l2_penalty = 1e-3,
-        prune_graph = False
+        l2_penalty = 0,
+        prune_graph = False,
+        fine_tune_end_to_end = True,
+        fine_tune_epochs = 50,
+        simple_classifier = simple_classifier,
+        final_model = 'auto',
+        final_training_epochs = 20,
+        final_dropout_p = .3
+        # max_correlation = .5
     ):
         self.n_components = n_components
         self.model = model
@@ -109,45 +143,128 @@ class SKN(BaseEstimator):
         self.cluster_subnet_dropout_p = cluster_subnet_dropout_p
         self.is_tokens = False # forces TF-IDF preprocessing if preprocessing unspecified
         self.cluster_subsample_n = cluster_subsample_n
-        self.zero_cutoff = zero_cutoff
+        self.initial_zero_cutoff = initial_zero_cutoff
+        self.minimum_zero_cutoff = minimum_zero_cutoff
+        self.update_zero_cutoff = update_zero_cutoff
         self.internal_dim = internal_dim
         self.cluster_subnet_training_epochs = cluster_subnet_training_epochs
         self.semisupervised_weight = semisupervised_weight
         self.l2_penalty = l2_penalty
         self.prune_graph = prune_graph
+        self.fine_tune_end_to_end = fine_tune_end_to_end
+        self.fine_tune_epochs = fine_tune_epochs
+        self.simple_classifier = simple_classifier
+        self.final_training_epochs = final_training_epochs
+        self.final_model = final_model
+        self.final_dropout_p = final_dropout_p
+        # self.max_correlation = max_correlation
 
-    def _print_with_verbosity(self, message, level):
-        if level <= self.verbose_level:
+    def find_differentiating_features(self, sample, context, n_context_samples = 400, feature_names = None):
+        assert self.best_full_net is not None, "have not trained a prediction network yet!"
+
+        if n_context_samples < context.shape[0]:
+            context_subsample_inds = np.random.choice(context.shape[0], n_context_samples, replace = False)
+            context_subsample = context[context_subsample_inds]
+        else:
+            context_subsample = context
+
+        e = shap.DeepExplainer(self.best_full_net, context_subsample)
+
+        if sample.shape[0] == 1:
+            # only one sample so assuming need to add batch dimension
+            sample = sample.unsqueeze(0)
+
+        with nostdout():
+            shap_values, indexes = e.shap_values(sample, ranked_outputs = 1)
+
+        if type(sample) is not np.ndarray:
+            sample = sample.cpu().numpy()
+
+        if len(context.shape) == 4:
+            # assuming image
+            shap_values = [np.swapaxes(np.swapaxes(s, 2, 3), 1, -1) for s in shap_values]
+            if sample.shape[1] == 1:
+                # need valid image shape for matplotlib
+                sample = sample.squeeze(1)
+            shap.image_plot(shap_values, -sample)
+        else:
+            # assuming not image
+            shap.force_plot(e.expected_value, shap_values, sample, feature_names = feature_names, matplotlib = True)
+
+    def summerize_differentiating_features(self, X, n_samples = 200, n_context_samples = 400):
+        # split the dataset into clusters and average differentiating features in each cluster
+        n_samples = min(n_samples, X.shape[0])
+        sample_inds = np.random.choice(X.shape[0], n_samples, replace = False)
+        samples = X[sample_inds]
+        clusters = self.predict(samples)
+
+        n_context_samples = min(n_context_samples, X.shape[0])
+        context_sample_inds = np.random.choice(X.shape[0], n_context_samples, replace = False)
+        context_samples = X[context_sample_inds]
+        context_samples = context_samples.to(self.device)
+
+        e = shap.DeepExplainer(self.best_full_net, context_samples)
+
+        summerizations = defaultdict(lambda : np.zeros(X.shape[1:]))
+        average_samples = defaultdict(lambda : np.zeros(X.shape[1:]))
+        counts = Counter(clusters)
+
+        self._print_with_verbosity("finding differentiating features across the dataset...", 1)
+
+        for cluster, sample in self._progressbar_with_verbosity(zip(clusters, samples), 1, max_value = n_samples):
+            with nostdout():
+                shap_values, indexes = e.shap_values(sample.unsqueeze(0), ranked_outputs = 1)
+            summerizations[cluster] += shap_values[0].squeeze(0) / counts[cluster]
+            average_samples[cluster] += sample.cpu().numpy() / counts[cluster]
+
+        # if type(samples) is not np.ndarray:
+        #     samples = samples.cpu().numpy()
+
+        # recall that dictionaries are ordered in Python3
+        summery = np.array(list(summerizations.values())).squeeze(1)
+        averages = np.array(list(average_samples.values())).squeeze(1)
+
+        shap.image_plot(summery, -averages)
+
+
+    def _print_with_verbosity(self, message, level, strict = False):
+        if level <= self.verbose_level and (not strict or level == self.verbose_level):
             print(message)
 
-    def _progressbar_with_verbosity(self, data, level, max_value = None):
-        if level <= self.verbose_level:
+    def _progressbar_with_verbosity(self, data, level, max_value = None, strict = False):
+        if level <= self.verbose_level and (not strict or level == self.verbose_level):
             for datum in progressbar.progressbar(data, max_value = max_value):
                 yield datum
         else:
             for datum in data:
                 yield datum
 
-    def _select_model(self, X):
+    def _select_model(self, X, n_outputs = None, dropout_p = 0):
+        if n_outputs is None:
+            n_outputs = self.n_components
         # not sure if allowed to modify model attribute under sklearn rules
-        n_dims = len(X.shape)
-        if type(X) is tuple:
+        if type(X) is tuple or type(X) is list:
             self._print_with_verbosity("assuming token-based data, using bag-of-words model", 1)
             self.is_tokens = True
             vocab = set()
             for x in X:
                 vocab.update(x)
             vocab_size = len(vocab)
-            self.model = BOWNN(self.n_components, vocab_size, internal_dim = self.internal_dim)
-        elif n_dims == 2:
-            self._print_with_verbosity("using fully connected neural network", 1)
-            self.model = FFNN(self.n_components, X.shape[1])
-        elif n_dims == 4:
-            self._print_with_verbosity("using convolutional neural network", 1)
-            n_layers = int(np.log2(min(X.shape[2], X.shape[3])))
-            self.model = CNN(self.n_components, n_layers, internal_dim = self.internal_dim)
+            to_model = BOWNN(n_outputs, vocab_size, internal_dim = self.internal_dim)
         else:
-            assert False, "not sure which neural network to use based off data provided"
+            n_dims = len(X.shape)
+            if n_dims == 2:
+                self._print_with_verbosity("using fully connected neural network", 1)
+                to_model = FFNN(n_outputs, X.shape[1])
+            elif n_dims == 4:
+                self._print_with_verbosity("using convolutional neural network", 1)
+                n_layers = int(np.log2(min(X.shape[2], X.shape[3])))
+                to_model = CNN(n_outputs, n_layers, internal_dim = self.internal_dim, p = dropout_p)
+                # self.model = ClusterNet(X.shape[-1]*X.shape[-2], self.n_components)
+            else:
+                assert False, "not sure which neural network to use based off data provided"
+
+        return to_model
 
     def _get_near_and_far_pairs_mem_efficient_chunks(self, X, block_size = 512, return_sorted = True):
         n_neighbors = self.max_neighbors
@@ -194,6 +311,7 @@ class SKN(BaseEstimator):
         if self.is_tokens and self.neighbors_preprocess is None:
             self._print_with_verbosity("using tokenized data without neighbors preprocessing so using TF-IDF transform", 2)
             self.neighbors_preprocess = tokens_to_tfidf
+            self.metric = 'cosine'
 
         if self.neighbors_preprocess is not None:
             neighbors_X = self.neighbors_preprocess(neighbors_X)
@@ -208,6 +326,8 @@ class SKN(BaseEstimator):
         # and -1 if there is no label
         first_label = []
         second_label = []
+
+        self._print_with_verbosity("building dataset from nearest neighbors graph", 1)
         
         already_paired = set()
         for first, seconds in enumerate(closest):
@@ -291,10 +411,10 @@ class SKN(BaseEstimator):
 
             if self.semisupervised:
                 which = first_label != -1
-                first_label_pred = self.semisupervised_model(data[which, 0])
+                first_label_pred = self.semisupervised_model.cluster_net(output_1[which])
                 loss = loss + F.cross_entropy(first_label_pred, first_label[which])*self.semisupervised_weight
                 which = second_label != -1
-                second_label_pred = self.semisupervised_model(data[which, 1])
+                second_label_pred = self.semisupervised_model.cluster_net(output_2[which])
                 loss = loss + F.cross_entropy(second_label_pred, second_label[which])*self.semisupervised_weight
 
             if self.l2_penalty > 0:
@@ -327,7 +447,8 @@ class SKN(BaseEstimator):
 
     def transform(self, X, to_numpy = True, batch_size = 4096, model = None):
         if model is None:
-            model = self.model
+            assert self.best_embedding_net is not None, "no embedding model trained yet!"
+            model = self.best_embedding_net
         # embeds the data
         dataset = TensorDataset(X)
         embed_loader = DataLoader(dataset, shuffle = False, batch_size = batch_size)
@@ -400,51 +521,91 @@ class SKN(BaseEstimator):
         D = pairwise_distances(X[inds], n_jobs = -1, metric = 'euclidean')
 
         sigma = (self.exp_dist*self.gamma)**2
-        A = np.exp(-D**2 / sigma)
+        A = np.exp(-D**2 / sigma) # known bug: sigma should be larger because subsampling
 
         sums = A.sum(axis = 1)
         D = np.diag(sums)
         L = D - A
 
-        vals, vecs = eigh(L, eigvals = [0, int(X.shape[0]**.5)]) # assuming only sqrt possible clusters
+        vals, vecs = eigh(L, turbo = True)#, eigvals = [0, int(X.shape[0]**.5)]) # assuming only sqrt possible clusters
         # print(vals)
 
-        n_zeros = np.sum(vals < self.zero_cutoff)
+        n_zeros = np.sum(vals <= self.zero_cutoff)
         self._print_with_verbosity(f"found {n_zeros} candidate clusters", 3)
-        init_clusters = KMeans(n_zeros, n_init = 100).fit_predict(vecs[:, :n_zeros])
+        k = KMeans(n_zeros, n_init = 100)
+        init_clusters = k.fit_predict(vecs[:, :n_zeros])
         # print(np.unique(init_clusters))
 
         n_neighbors = int(2*np.log2(X.shape[0]))
         clusters = KNeighborsClassifier(n_neighbors).fit(X[inds], init_clusters).predict(X)
-        # print(np.unique(clusters))
         clusters = change_cluster_labels_to_sequential(clusters)
-        # print(clusters.shape)
-        # print(clusters[:10])
 
         self.n_clusters = np.unique(clusters).shape[0]
 
+        # consider stopping training when eigengap stops increasing?
+
+        specificity = self.n_clusters**2 / n_zeros
+        eigengap_1 = vals[self.n_clusters] - vals[0]
+        final_eigenval = vals[self.n_clusters - 1]
+        # now select for first eigenval greater than this one because multiplicity
+        eigengap_2 = vals[vals > final_eigenval][0] - final_eigenval
+        self._print_with_verbosity(f"specificity of clustering: {specificity}, eigengap_1: {eigengap_1}, eigengap_2: {eigengap_2}", 1)
+
+        # dbs = davies_bouldin_score(vecs[:, :n_zeros], clusters[inds])
+        chs_eig = calinski_harabasz_score(vecs[:, :n_zeros], clusters[inds])
+        chs_embed = calinski_harabasz_score(X[inds], clusters[inds])
+        self._print_with_verbosity(f"Calinski-Barabasz score in eigenspace: {chs_eig}, in embedding space: {chs_embed}", 1)
+
+        if self.update_zero_cutoff:
+            self._update_zero_cutoff(vals)
+
         return clusters
 
-    def predict(self, X, model = None):
+    def _update_zero_cutoff(self, eign):
+        # slowly decrease zero cutoff for spectral clustering calculation
+        # reduces noise in clustering
+        # using a separate function because might make this more complex in the future
+        # this cutoff is just the first eigenvalue that DID NOT correspond to a cluster
+        # new_zero_cutoff = min(self.zero_cutoff, eign[self.n_clusters])
+        # new_zero_cutoff = max(new_zero_cutoff, 1e-8) # don't want negative, that's just numerical error
+        new_zero_cutoff = max(10*eign[self.n_clusters], self.minimum_zero_cutoff)
+
+        if new_zero_cutoff != self.zero_cutoff:
+            self._print_with_verbosity(f"updating eigenvalue zero cutoff from {self.zero_cutoff} to {new_zero_cutoff}", 3)
+            self.zero_cutoff = new_zero_cutoff
+
+    def predict(self, X, model = None, return_embedding = False):
         if model is None:
             assert self.best_full_net is not None, "have not trained a prediction network yet!"
-            model = self.best_full_net
+            model = self.best_full_net # if not self.final_model_trained else self.final_model
 
         dataset = TensorDataset(X)
         data_loader = DataLoader(dataset, batch_size = 4096, shuffle = False)
         preds = []
+        embeddings = []
 
         model = model.to(self.device)
         model.eval()
         with torch.no_grad():
-            for data in progressbar.progressbar(data_loader):
+            for data in self._progressbar_with_verbosity(data_loader, 3):
                 data = data[0].to(self.device)
-                _, pred = torch.max(model(data), 1)
+
+                if return_embedding:
+                    embedding = model.embed_net(data)
+                    _, pred = torch.max(model.cluster_net(embedding), 1)
+                    embeddings.extend(embedding.cpu().numpy())
+                else:
+                    _, pred = torch.max(model(data), 1)
+
                 preds.extend(pred.cpu().numpy())
 
+        embeddings = np.array(embeddings)
         preds = np.array(preds)
 
-        return preds
+        if return_embedding:
+            return preds, embeddings
+        else:
+            return preds
 
     def _build_cluster_subnet(self, X, transformed, clusters):
         # creates clustering subnet and updates best model
@@ -460,7 +621,7 @@ class SKN(BaseEstimator):
         dataset = TensorDataset(torch.Tensor(transformed), torch.Tensor(clusters).long())
         data_loader = DataLoader(dataset, shuffle = True, batch_size = self.batch_size)
 
-        cluster_subnet = ClusterNet(transformed.shape[-1], self.n_clusters)
+        cluster_subnet = ClusterNet(transformed.shape[-1], self.n_clusters, p = self.cluster_subnet_dropout_p)
         cluster_subnet_optimizer = optim.Adam(cluster_subnet.parameters())
         cluster_subnet_crit = nn.CrossEntropyLoss(weight = cluster_weights)
         cluster_subnet.train()
@@ -479,32 +640,89 @@ class SKN(BaseEstimator):
         full_net.train()
         full_net = full_net.to(self.device)
 
-        for i in self._progressbar_with_verbosity(range(self.cluster_subnet_training_epochs), 2): # NOTE: in original, this was 20, not 50, by default
-            self._train_one_epoch(full_net, data_loader, full_net_optimizer, full_net_crit)
+        if self.fine_tune_end_to_end:
+            self._print_with_verbosity("fine-tuning whole end-to-end network", 2)
 
-        preds = self.predict(X, model = full_net)
+            for i in self._progressbar_with_verbosity(range(self.fine_tune_epochs), 2):
+                self._train_one_epoch(full_net, data_loader, full_net_optimizer, full_net_crit)
+
+        preds, embedding = self.predict(X, model = full_net, return_embedding = True)
 
         # new_transformed = self.transform(X, model = full_net.embed_net)
 
         # delta_mi = silhouette_score(new_transformed, preds)
-        delta_mi = mutual_info_score(preds, clusters)
+        # delta_mi = adjusted_mutual_info_score(preds, clusters)
+        preds_entropy = get_entropy(list(Counter(preds).values()))
+        embedding_score = self._test_label_fit(embedding, preds) # maybe this should use transformed instead?
+        sample_score = self._test_label_fit(X, preds) # compensate for random
+        delta_mi = preds_entropy * embedding_score * sample_score # average ability to pattern-match times information content of labels
+        # random_labels_score = self._test_label_fit(X, np.random.randint(0, self.n_clusters, X.shape[0]))
+        self._print_with_verbosity(f"this delta mi: {delta_mi}, from embedding: {embedding_score}, from original data: {sample_score}, entropy: {preds_entropy}", 1)
         if delta_mi > self.best_delta_mi:
-            self._print_with_verbosity(f"found new best delta mi of {delta_mi}", 1)
+            self._print_with_verbosity(f"found new best delta mi", 1)
             self.best_delta_mi = delta_mi
             self.best_full_net = full_net
             self.best_n_clusters = self.n_clusters
+            self.best_embedding_net = copy.deepcopy(self.model)
 
         return preds
+
+    def _test_label_fit(self, X, y, test_proportion = .2):
+        # trains a simple classifier to predict the labels from the dataset
+        # if the labels are a good fit, this score should go up
+        X = X.reshape(X.shape[0], -1)
+        # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = test_proportion)
+        # c = naive_bayes.ComplementNB()
+        # X -= X.min() # get rid of negative values for CNB
+        c = self.simple_classifier
+        with nostdout():
+            # score = cross_val_score(c, X, y, n_jobs = -1).mean() # pretty sure this uses reproducable random state by default
+            # since only training internally, only test internally for this
+            score = np.exp(-log_loss(y, c.fit(X, y).predict_proba(X)))
+
+        return score
+
+    def _fit_to_noisy_labels(self, X, labels, y_for_verification = None, n_verification_classes = None):
+        # leveraging https://arxiv.org/pdf/1705.10694.pdf
+        # idea is, cluster labels can be treated as noisy labels, and deep neural networks
+        # are VERY good at learning with noisy labels, so just train a new one from scratch
+        # the siamese net may be suboptimal because its features are biased by the nearest neighbors graph
+        if y_for_verification is not None and n_verification_classes is None:
+            n_verification_classes = np.unique(y_for_verification).shape[0]
+
+        if self.final_model == "auto":
+            self.final_model = self._select_model(X, n_outputs = self.n_clusters, dropout_p = self.final_dropout_p)
+
+        dataset = TensorDataset(X, torch.Tensor(labels).long())
+        data_loader = DataLoader(dataset, shuffle = True, batch_size = self.batch_size)
+
+        self.final_model = self.final_model.to(self.device)
+        optimizer = optim.Adam(self.final_model.parameters())
+        crit = nn.CrossEntropyLoss()
+
+        for i in self._progressbar_with_verbosity(range(self.final_training_epochs), 1):
+            self._train_one_epoch(self.final_model, data_loader, optimizer, crit)
+            if y_for_verification is not None:
+                preds = self.predict(X, model = self.final_model)
+                nmi = normalized_mutual_info_score(preds, y_for_verification)
+                self._print_with_verbosity(f"NMI of final network: {nmi}", 1)
+                if self.n_clusters == n_verification_classes:
+                    acc = get_accuracy(preds, y_for_verification)
+                    self._print_with_verbosity(f"Accuracy of final network: {acc}", 1)
+
+        self.final_model_trained = True
+
 
     def fit(self, X, y = None, y_for_verification = None, plot = False):
         # assert not self.semisupervised, "semisupervised not supported yet"
 
         self.best_delta_mi = -1
         self.best_full_net = None
+        self.best_embedding_net = None
+        # self.final_model = None
+        self.final_model_trained = False
         self.best_n_clusters = 1
-
-        if type(X) is not torch.Tensor:
-            X = torch.Tensor(X)
+        self.zero_cutoff = self.initial_zero_cutoff
 
         if self.random_seed is not None:
             np.random.seed(self.random_seed)
@@ -523,11 +741,19 @@ class SKN(BaseEstimator):
             self._print_with_verbosity(f"number of classes in verification set: {verify_n_classes}", 3)
 
         if self.model == "auto":
-            self._select_model(X)
+            self.model = self._select_model(X)
+
+        if self.is_tokens:
+            X = pad_sequence(X, padding_value = 0, batch_first = True)
+
+        if type(X) is not torch.Tensor:
+            X = torch.Tensor(X)
 
         self.device = torch.device("cuda") if (torch.cuda.is_available() and self.use_gpu) else torch.device("cpu")
+        if self.device.type == "cpu":
+            self._print_with_verbosity("WARNING: using CPU, may be very slow", 0, strict = True)
 
-        self._print_with_verbosity(f"using torch device {self.device}", 2)
+        self._print_with_verbosity(f"using torch device {self.device}", 1)
 
         self._print_with_verbosity("building dataset", 1)
 
@@ -552,12 +778,12 @@ class SKN(BaseEstimator):
 
         self._print_with_verbosity("training", 1)
 
-        for i in range(self.epochs):
+        for i in self._progressbar_with_verbosity(range(self.epochs), 0, strict = True):
             self.model.train()
             self._print_with_verbosity(f"this is epoch {i}", 1)
             self._train_siamese_one_epoch(data_loader)
             self.model.eval()
-            transformed = self.transform(X)
+            transformed = self.transform(X, model = self.model)
 
             self._get_exp_dist(data_loader)
             self._print_with_verbosity(f"found expected distance between related points as {self.exp_dist}", 3)
@@ -584,10 +810,14 @@ class SKN(BaseEstimator):
                     self._print_with_verbosity(f"number of predicted classes did not match number of clusters so not computing accuracy, correct {verify_n_classes} vs {self.n_clusters}", 2)
 
             if plot and self.n_components == 2:
-                plot_2d(transformed, cluster_assignments)
+                plot_2d(transformed, cluster_assignments, show = False, no_legend = True)
 
                 if use_y_to_verify_performance:
-                    plot_2d(transformed, y_for_verification)
+                    plot_2d(transformed, y_for_verification, show = False)
+
+                plt.show()
+
+        # self._fit_to_noisy_labels(X, labels = self.predict(X), y_for_verification = y_for_verification if use_y_to_verify_performance else None)
 
 
 
@@ -598,7 +828,7 @@ if __name__ == "__main__":
     n = 500
     semisupervised_proportion = .2
 
-    e = SKN(n_components = 8, internal_dim = 16, epochs = 30, semisupervised = True, verbose_level = 3, gamma = .5)
+    e = SKN(n_components = 2, internal_dim = 16, epochs = 10, semisupervised = False, verbose_level = 3, gamma = 1, l2_penalty = 0, learning_rate = 1e-4)
 
     USPS_data_train = USPS("./", train = True, download = True)
     USPS_data_test = USPS("./", train = False, download = True)
@@ -613,4 +843,13 @@ if __name__ == "__main__":
     y_for_verification = copy.deepcopy(y_numpy)
     y_numpy[which] = -1
 
-    e.fit(X, y_numpy, y_for_verification = y_for_verification, plot = True)
+    # news_train, news_test = AG_NEWS('./', ngrams = 1)
+    # X, y = zip(*([item[1], item[0]] for item in news_test))
+    # X = X[:n]
+    # y = y[:n]
+    # y_numpy = np.array(y)
+    # y_for_verification = copy.deepcopy(y_numpy)
+
+    e.fit(X, y_numpy, y_for_verification = y_for_verification, plot = False)
+    # e.find_differentiating_features(X[0], X)
+    e.summerize_differentiating_features(X)
