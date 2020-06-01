@@ -66,7 +66,7 @@ def fcdf(x, d1, d2, device = device):
 
     return p
 
-def f_loss(x1, x2, y, ignore = .9, epsilon = 1e-4, device = device):
+def f_loss(x1, x2, y, ignore = .9, epsilon = 1e-4, device = device, min_p = 0):
     if type(x1) is tuple:
         v = x1[0].shape[-1]
         # print(v)
@@ -79,16 +79,23 @@ def f_loss(x1, x2, y, ignore = .9, epsilon = 1e-4, device = device):
     dist = torch.norm(x1 - x2, p = 2, dim = 1)**2
 
     # get parameters for f distribution. not sure these are right..
-    d1 = v
-    d2 = torch.Tensor([1]).to(device)
+    # d1 = x1.shape[0] - v + 1
+    d1 = torch.Tensor([1]).to(device)
+    d2 = v
 
     # compute p-value
     p = reg_betainc(d1*dist/(d1*dist+d2), d1/2, d2/2)
     p = p.to(device)
     p[~paired] = 1 - p[~paired]
 
+    if min_p > 0:
+        p[paired] = torch.max(p[paired], torch.Tensor([min_p]).to(device))
+
     # reject hypothesis that this model explains the data if p is significant
     usage = p < ignore
+    # or interpret as 'these values are too extreme for this model to meaningfully optimize'
+    # ie let discovered features determine their locations
+    # usage = torch.abs(p - .5) > ignore - .5
 
     paired_loss = torch.sum(p[paired]*usage[paired])
     assert not torch.isnan(paired_loss), str(p[paired])
