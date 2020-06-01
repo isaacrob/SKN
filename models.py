@@ -100,10 +100,10 @@ class CNN(nn.Module):
         return x
 
 class FFNN(nn.Module):
-    def __init__(self, n_components, input_dim, internal_scale = 8, n_hidden_layers = 2):
+    def __init__(self, n_components, input_dim, internal_dim, n_hidden_layers = 2):
         super().__init__()
 
-        self.internal_dim = int(internal_scale*input_dim)
+        self.internal_dim = internal_dim
 
         self.lin_in = nn.Linear(input_dim, self.internal_dim)
 

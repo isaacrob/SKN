@@ -90,19 +90,19 @@ class SKN(BaseEstimator):
         n_components = 2,
         model = 'auto',
         min_neighbors = 1,
-        max_neighbors = 20,
+        max_neighbors = 10,
         snn = True,
         batch_size = 256,
         ignore = .9,
         metric = 'euclidean',
         neighbors_preprocess = None,
         use_gpu = True,
-        learning_rate = 5e-4,
+        learning_rate = 1e-3,
         optimizer_override = None,
         epochs = 10,
         verbose_level = 1,
         random_seed = 37,
-        gamma = 1,
+        gamma = .5,
         semisupervised = False,
         cluster_subnet_dropout_p = .3,
         is_tokens = False,
@@ -118,10 +118,11 @@ class SKN(BaseEstimator):
         fine_tune_end_to_end = True,
         fine_tune_epochs = 50,
         simple_classifier = simple_classifier,
-        final_model = 'auto',
+        # final_model = 'auto',
         final_training_epochs = 20,
-        final_dropout_p = .3
-        # max_correlation = .5
+        final_dropout_p = .3,
+        min_p = 0,
+        max_correlation = .9
     ):
         self.n_components = n_components
         self.model = model
@@ -155,9 +156,16 @@ class SKN(BaseEstimator):
         self.fine_tune_epochs = fine_tune_epochs
         self.simple_classifier = simple_classifier
         self.final_training_epochs = final_training_epochs
-        self.final_model = final_model
+        # self.final_model = final_model
         self.final_dropout_p = final_dropout_p
-        # self.max_correlation = max_correlation
+        self.min_p = min_p
+        self.max_correlation = max_correlation
+
+        self.best_full_net = None
+        self.best_embedding_net = None
+        self.optimizer = None
+        self.semisupervised_model = None
+        # self.final_model = None
 
     def find_differentiating_features(self, sample, context, n_context_samples = 400, feature_names = None):
         assert self.best_full_net is not None, "have not trained a prediction network yet!"
@@ -189,7 +197,7 @@ class SKN(BaseEstimator):
             shap.image_plot(shap_values, -sample)
         else:
             # assuming not image
-            shap.force_plot(e.expected_value, shap_values, sample, feature_names = feature_names, matplotlib = True)
+            shap.force_plot(e.expected_value[0], shap_values[0], sample, feature_names = feature_names, matplotlib = True)
 
     def summerize_differentiating_features(self, X, n_samples = 200, n_context_samples = 400):
         # split the dataset into clusters and average differentiating features in each cluster
@@ -255,7 +263,7 @@ class SKN(BaseEstimator):
             n_dims = len(X.shape)
             if n_dims == 2:
                 self._print_with_verbosity("using fully connected neural network", 1)
-                to_model = FFNN(n_outputs, X.shape[1])
+                to_model = FFNN(n_outputs, X.shape[1], internal_dim = self.internal_dim)
             elif n_dims == 4:
                 self._print_with_verbosity("using convolutional neural network", 1)
                 n_layers = int(np.log2(min(X.shape[2], X.shape[3])))
@@ -393,6 +401,16 @@ class SKN(BaseEstimator):
 
         return dataset
 
+    def _orthgonality_regularizer(self, x):
+        diff = 0
+        for i in range(x.shape[1]):
+            for j in range(i+1, x.shape[1]):
+                diff = diff + torch.abs(F.cosine_similarity(x[:, i], x[:, j], dim = 0))
+                # diff = diff + torch.abs((x[:, i] * x[:, j]).sum())
+        diff = diff / ((x.shape[1]*(x.shape[1]-1))/2)
+
+        return diff
+
     def _train_siamese_one_epoch(self, data_loader):
         epoch_loss = 0
         self.model.train()
@@ -407,7 +425,7 @@ class SKN(BaseEstimator):
             output_1 = self.model(data[:, 0])
             output_2 = self.model(data[:, 1])
 
-            loss = f_loss(output_1, output_2, target, ignore = self.ignore, device = self.device)
+            loss = f_loss(output_1, output_2, target, ignore = self.ignore, device = self.device, min_p = self.min_p)
 
             if self.semisupervised:
                 which = first_label != -1
@@ -419,6 +437,10 @@ class SKN(BaseEstimator):
 
             if self.l2_penalty > 0:
                 loss = loss + self.l2_penalty*torch.mean((torch.norm(output_1, p = 2, dim = 1) + torch.norm(output_2, p = 2, dim = 1)))
+
+            if self.max_correlation is not None:
+                diff = (self._orthgonality_regularizer(output_1) + self._orthgonality_regularizer(output_2)) / 2
+                loss = loss + torch.max(torch.Tensor([self.max_correlation]).to(self.device), diff) - self.max_correlation
 
             loss.backward()
             self.optimizer.step()
@@ -532,10 +554,12 @@ class SKN(BaseEstimator):
 
         n_zeros = np.sum(vals <= self.zero_cutoff)
         self._print_with_verbosity(f"found {n_zeros} candidate clusters", 3)
+        self._print_with_verbosity(f"running k-means..", 3)
         k = KMeans(n_zeros, n_init = 100)
         init_clusters = k.fit_predict(vecs[:, :n_zeros])
         # print(np.unique(init_clusters))
 
+        self._print_with_verbosity(f"applying KNN filter..", 3)
         n_neighbors = int(2*np.log2(X.shape[0]))
         clusters = KNeighborsClassifier(n_neighbors).fit(X[inds], init_clusters).predict(X)
         clusters = change_cluster_labels_to_sequential(clusters)
@@ -544,17 +568,17 @@ class SKN(BaseEstimator):
 
         # consider stopping training when eigengap stops increasing?
 
-        specificity = self.n_clusters**2 / n_zeros
-        eigengap_1 = vals[self.n_clusters] - vals[0]
-        final_eigenval = vals[self.n_clusters - 1]
-        # now select for first eigenval greater than this one because multiplicity
-        eigengap_2 = vals[vals > final_eigenval][0] - final_eigenval
-        self._print_with_verbosity(f"specificity of clustering: {specificity}, eigengap_1: {eigengap_1}, eigengap_2: {eigengap_2}", 1)
+        # specificity = self.n_clusters**2 / n_zeros
+        # eigengap_1 = vals[self.n_clusters] - vals[0]
+        # final_eigenval = vals[self.n_clusters - 1]
+        # # now select for first eigenval greater than this one because multiplicity
+        # eigengap_2 = vals[vals > final_eigenval][0] - final_eigenval
+        # self._print_with_verbosity(f"specificity of clustering: {specificity}, eigengap_1: {eigengap_1}, eigengap_2: {eigengap_2}", 1)
 
         # dbs = davies_bouldin_score(vecs[:, :n_zeros], clusters[inds])
-        chs_eig = calinski_harabasz_score(vecs[:, :n_zeros], clusters[inds])
-        chs_embed = calinski_harabasz_score(X[inds], clusters[inds])
-        self._print_with_verbosity(f"Calinski-Barabasz score in eigenspace: {chs_eig}, in embedding space: {chs_embed}", 1)
+        # chs_eig = calinski_harabasz_score(vecs[:, :n_zeros], clusters[inds])
+        # chs_embed = calinski_harabasz_score(X[inds], clusters[inds])
+        # self._print_with_verbosity(f"Calinski-Barabasz score in eigenspace: {chs_eig}, in embedding space: {chs_embed}", 1)
 
         if self.update_zero_cutoff:
             self._update_zero_cutoff(vals)
@@ -646,30 +670,37 @@ class SKN(BaseEstimator):
             for i in self._progressbar_with_verbosity(range(self.fine_tune_epochs), 2):
                 self._train_one_epoch(full_net, data_loader, full_net_optimizer, full_net_crit)
 
-        preds, embedding = self.predict(X, model = full_net, return_embedding = True)
+        preds = self.predict(X, model = full_net, return_embedding = False)
 
         # new_transformed = self.transform(X, model = full_net.embed_net)
 
         # delta_mi = silhouette_score(new_transformed, preds)
         # delta_mi = adjusted_mutual_info_score(preds, clusters)
-        preds_entropy = get_entropy(list(Counter(preds).values()))
-        embedding_score = self._test_label_fit(embedding, preds) # maybe this should use transformed instead?
-        sample_score = self._test_label_fit(X, preds) # compensate for random
-        delta_mi = preds_entropy * embedding_score * sample_score # average ability to pattern-match times information content of labels
+        # preds_entropy = get_entropy(list(Counter(preds).values()))
+        # embedding_score = self._test_label_fit(embedding, preds) # maybe this should use transformed instead?
+        # sample_score = self._test_label_fit(X, preds) # compensate for random
+        # delta_mi = preds_entropy * embedding_score * sample_score # average ability to pattern-match times information content of labels
         # random_labels_score = self._test_label_fit(X, np.random.randint(0, self.n_clusters, X.shape[0]))
-        self._print_with_verbosity(f"this delta mi: {delta_mi}, from embedding: {embedding_score}, from original data: {sample_score}, entropy: {preds_entropy}", 1)
-        if delta_mi > self.best_delta_mi:
-            self._print_with_verbosity(f"found new best delta mi", 1)
-            self.best_delta_mi = delta_mi
-            self.best_full_net = full_net
-            self.best_n_clusters = self.n_clusters
-            self.best_embedding_net = copy.deepcopy(self.model)
+        # self._print_with_verbosity(f"this delta mi: {delta_mi}, from embedding: {embedding_score}, from original data: {sample_score}, entropy: {preds_entropy}", 1)
+        # if delta_mi > self.best_delta_mi:
+            # self._print_with_verbosity(f"found new best delta mi", 1)
+
+        # we're just going to take the most recent epoch
+        # this is reasonable because of the new changes to the F-distribution loss
+        # self.best_delta_mi = delta_mi
+        self.best_full_net = full_net
+        self.best_n_clusters = self.n_clusters
+        self.best_embedding_net = copy.deepcopy(self.model)
 
         return preds
 
     def _test_label_fit(self, X, y, test_proportion = .2):
         # trains a simple classifier to predict the labels from the dataset
         # if the labels are a good fit, this score should go up
+        if np.unique(y).shape[0] == 1:
+            # single label dataset has accuracy 1
+            return 1
+
         X = X.reshape(X.shape[0], -1)
         # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = test_proportion)
         # c = naive_bayes.ComplementNB()
@@ -682,35 +713,35 @@ class SKN(BaseEstimator):
 
         return score
 
-    def _fit_to_noisy_labels(self, X, labels, y_for_verification = None, n_verification_classes = None):
-        # leveraging https://arxiv.org/pdf/1705.10694.pdf
-        # idea is, cluster labels can be treated as noisy labels, and deep neural networks
-        # are VERY good at learning with noisy labels, so just train a new one from scratch
-        # the siamese net may be suboptimal because its features are biased by the nearest neighbors graph
-        if y_for_verification is not None and n_verification_classes is None:
-            n_verification_classes = np.unique(y_for_verification).shape[0]
+    # def _fit_to_noisy_labels(self, X, labels, y_for_verification = None, n_verification_classes = None):
+    #     # leveraging https://arxiv.org/pdf/1705.10694.pdf
+    #     # idea is, cluster labels can be treated as noisy labels, and deep neural networks
+    #     # are VERY good at learning with noisy labels, so just train a new one from scratch
+    #     # the siamese net may be suboptimal because its features are biased by the nearest neighbors graph
+    #     if y_for_verification is not None and n_verification_classes is None:
+    #         n_verification_classes = np.unique(y_for_verification).shape[0]
 
-        if self.final_model == "auto":
-            self.final_model = self._select_model(X, n_outputs = self.n_clusters, dropout_p = self.final_dropout_p)
+    #     if self.final_model == "auto":
+    #         self.final_model = self._select_model(X, n_outputs = self.n_clusters, dropout_p = self.final_dropout_p)
 
-        dataset = TensorDataset(X, torch.Tensor(labels).long())
-        data_loader = DataLoader(dataset, shuffle = True, batch_size = self.batch_size)
+    #     dataset = TensorDataset(X, torch.Tensor(labels).long())
+    #     data_loader = DataLoader(dataset, shuffle = True, batch_size = self.batch_size)
 
-        self.final_model = self.final_model.to(self.device)
-        optimizer = optim.Adam(self.final_model.parameters())
-        crit = nn.CrossEntropyLoss()
+    #     self.final_model = self.final_model.to(self.device)
+    #     optimizer = optim.Adam(self.final_model.parameters())
+    #     crit = nn.CrossEntropyLoss()
 
-        for i in self._progressbar_with_verbosity(range(self.final_training_epochs), 1):
-            self._train_one_epoch(self.final_model, data_loader, optimizer, crit)
-            if y_for_verification is not None:
-                preds = self.predict(X, model = self.final_model)
-                nmi = normalized_mutual_info_score(preds, y_for_verification)
-                self._print_with_verbosity(f"NMI of final network: {nmi}", 1)
-                if self.n_clusters == n_verification_classes:
-                    acc = get_accuracy(preds, y_for_verification)
-                    self._print_with_verbosity(f"Accuracy of final network: {acc}", 1)
+    #     for i in self._progressbar_with_verbosity(range(self.final_training_epochs), 1):
+    #         self._train_one_epoch(self.final_model, data_loader, optimizer, crit)
+    #         if y_for_verification is not None:
+    #             preds = self.predict(X, model = self.final_model)
+    #             nmi = normalized_mutual_info_score(preds, y_for_verification)
+    #             self._print_with_verbosity(f"NMI of final network: {nmi}", 1)
+    #             if self.n_clusters == n_verification_classes:
+    #                 acc = get_accuracy(preds, y_for_verification)
+    #                 self._print_with_verbosity(f"Accuracy of final network: {acc}", 1)
 
-        self.final_model_trained = True
+    #     self.final_model_trained = True
 
 
     def fit(self, X, y = None, y_for_verification = None, plot = False):
@@ -720,9 +751,10 @@ class SKN(BaseEstimator):
         self.best_full_net = None
         self.best_embedding_net = None
         # self.final_model = None
-        self.final_model_trained = False
+        # self.final_model_trained = False
         self.best_n_clusters = 1
         self.zero_cutoff = self.initial_zero_cutoff
+        self.exp_dist = 0
 
         if self.random_seed is not None:
             np.random.seed(self.random_seed)
@@ -813,11 +845,132 @@ class SKN(BaseEstimator):
                 plot_2d(transformed, cluster_assignments, show = False, no_legend = True)
 
                 if use_y_to_verify_performance:
-                    plot_2d(transformed, y_for_verification, show = False)
+                    plot_2d(transformed, y_for_verification, show = False, no_legend = True)
 
                 plt.show()
 
         # self._fit_to_noisy_labels(X, labels = self.predict(X), y_for_verification = y_for_verification if use_y_to_verify_performance else None)
+
+    def save(self, file_path):
+        # load all the attributes into a dict
+        # then save that dict
+        state_dict = {
+            "n_components": self.n_components,
+            "min_neighbors": self.min_neighbors,
+            "max_neighbors": self.max_neighbors,
+            "snn": self.snn,
+            "batch_size": self.batch_size,
+            "ignore": self.ignore,
+            "metric": self.metric,
+            "neighbors_preprocess": self.neighbors_preprocess,
+            "use_gpu": self.use_gpu,
+            "learning_rate": self.learning_rate,
+            "optimizer_override": self.optimizer_override,
+            "epochs": self.epochs,
+            "verbose_level": self.verbose_level,
+            "random_seed": self.random_seed,
+            "gamma": self.gamma,
+            "semisupervised": self.semisupervised,
+            "cluster_subnet_dropout_p": self.cluster_subnet_dropout_p,
+            "is_tokens": self.is_tokens, # forces TF-IDF preprocessing if preprocessing unspecified
+            "cluster_subsample_n": self.cluster_subsample_n,
+            "initial_zero_cutoff": self.initial_zero_cutoff,
+            "minimum_zero_cutoff": self.minimum_zero_cutoff,
+            "update_zero_cutoff": self.update_zero_cutoff,
+            "internal_dim": self.internal_dim,
+            "cluster_subnet_training_epochs": self.cluster_subnet_training_epochs,
+            "semisupervised_weight": self.semisupervised_weight,
+            "l2_penalty": self.l2_penalty,
+            "prune_graph": self.prune_graph,
+            "fine_tune_end_to_end": self.fine_tune_end_to_end,
+            "fine_tune_epochs": self.fine_tune_epochs,
+            "simple_classifier": self.simple_classifier,
+            "final_training_epochs": self.final_training_epochs,
+            "final_dropout_p": self.final_dropout_p,
+            "min_p": self.min_p,
+
+            "model_state_dict": self.model.state_dict() if issubclass(type(self.model), torch.nn.Module) else None,
+            "model_name": self.model if not issubclass(type(self.model), torch.nn.Module) else None,
+            "best_delta_mi": self.best_delta_mi,
+            "best_full_net_state_dict": self.best_full_net.state_dict() if self.best_full_net is not None else None,
+            "best_embedding_net_state_dict": self.best_embedding_net.state_dict() if self.best_embedding_net is not None else None,
+            # "final_model_trained": self.final_model_trained,
+            "best_n_clusters": self.best_n_clusters,
+            "zero_cutoff": self.zero_cutoff,
+            "semisupervised_n_classes": self.semisupervised_model.cluster_net.n_classes if self.semisupervised_model is not None else None,
+            "semisupervised_model_state_dict": self.semisupervised_model.state_dict() if self.semisupervised_model is not None else None,
+            "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer is not None else None,
+            # "device_type": self.device.type, # will need something to handle this on load
+            # "final_model_state_dict": self.final_model.state_dict() if self.final_model_trained else None,
+            "exp_dist": self.exp_dist
+        }
+
+        torch.save(state_dict, file_path)
+
+    def load(self, file_path):
+        state_dict = torch.load(file_path)
+        self.n_components = state_dict["n_components"]
+        self.min_neighbors = state_dict["min_neighbors"]
+        self.max_neighbors = state_dict["max_neighbors"]
+        self.snn = state_dict["snn"]
+        self.batch_size = state_dict["batch_size"]
+        self.ignore = state_dict["ignore"]
+        self.metric = state_dict["metric"]
+        self.neighbors_preprocess = state_dict["neighbors_preprocess"]
+        self.use_gpu = state_dict["use_gpu"]
+        self.learning_rate = state_dict["learning_rate"]
+        self.optimizer_override = state_dict["optimizer_override"]
+        self.epochs = state_dict["epochs"]
+        self.verbose_level = state_dict["verbose_level"]
+        self.random_seed = state_dict["random_seed"]
+        self.gamma = state_dict["gamma"]
+        self.semisupervised = state_dict["semisupervised"]
+        self.cluster_subnet_dropout_p = state_dict["cluster_subnet_dropout_p"]
+        self.is_tokens = state_dict["is_tokens"]
+        self.cluster_subsample_n = state_dict["cluster_subsample_n"]
+        self.initial_zero_cutoff = state_dict["initial_zero_cutoff"]
+        self.minimum_zero_cutoff = state_dict["minimum_zero_cutoff"]
+        self.update_zero_cutoff = state_dict["update_zero_cutoff"]
+        self.internal_dim = state_dict["internal_dim"]
+        self.cluster_subnet_training_epochs = state_dict["cluster_subnet_training_epochs"]
+        self.semisupervised_weight = state_dict["semisupervised_weight"]
+        self.l2_penalty = state_dict["l2_penalty"]
+        self.prune_graph = state_dict["prune_graph"]
+        self.fine_tune_end_to_end = state_dict["fine_tune_end_to_end"]
+        self.fine_tune_epochs = state_dict["fine_tune_epochs"]
+        self.final_dropout_p = state_dict["final_dropout_p"]
+        self.min_p = state_dict["min_p"]
+
+        self.best_n_clusters = state_dict["best_n_clusters"]
+        # self.final_model_trained = state_dict["final_model_trained"]
+        self.zero_cutoff = state_dict["zero_cutoff"]
+        self.device = torch.device("cuda") if (torch.cuda.is_available() and self.use_gpu) else torch.device("cpu")
+        self.exp_dict = state_dict["exp_dist"]
+
+
+        if state_dict["model_state_dict"] is None:
+            self.model = state_dict["model_name"]
+        else:
+            self.model.load_state_dict(state_dict["model_state_dict"])
+            self.best_delta_mi = state_dict["best_delta_mi"]
+            if self.optimizer_override is None:
+                self.optimizer = optim.Adam(self.model.parameters(), lr = self.learning_rate)
+            else:
+                self.optimizer = self.optimizer_override(self.model.parameters(), lr = self.learning_rate)
+            self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+
+            if state_dict["best_full_net_state_dict"] is not None:
+                cluster_subnet = ClusterNet(self.n_components, self.best_n_clusters, p = self.cluster_subnet_dropout_p)
+                self.best_full_net = FullNet(copy.deepcopy(self.model), cluster_subnet)
+                self.best_full_net.load_state_dict(state_dict["best_full_net_state_dict"])
+                # should be the case that there's a best embedding net too. iff
+                self.best_embedding_net = copy.deepcopy(self.model)
+                self.best_embedding_net.load_state_dict(state_dict["best_embedding_net_state_dict"])
+
+            if state_dict["semisupervised_model_state_dict"] is not None:
+                label_subnet = ClusterNet(self.n_components, state_dict["semisupervised_n_classes"]).to(self.device)
+                self.semisupervised_model = FullNet(self.model, label_subnet).to(self.device)
+                self.semisupervised_model.load_state_dict(state_dict["semisupervised_model_state_dict"])
 
 
 
@@ -825,31 +978,43 @@ if __name__ == "__main__":
     from torchvision.datasets import MNIST, USPS, FashionMNIST, CIFAR10
     from torchtext.datasets import AG_NEWS
 
-    n = 500
+    n = None
     semisupervised_proportion = .2
 
-    e = SKN(n_components = 2, internal_dim = 16, epochs = 10, semisupervised = False, verbose_level = 3, gamma = 1, l2_penalty = 0, learning_rate = 1e-4)
+    e = SKN(n_components = 2, internal_dim = 64, epochs = 20, semisupervised = False, verbose_level = 3, gamma = 1, l2_penalty = 0, learning_rate = 1e-4)
 
-    USPS_data_train = USPS("./", train = True, download = True)
-    USPS_data_test = USPS("./", train = False, download = True)
-    USPS_data = ConcatDataset([USPS_data_test, USPS_data_train])
-    X, y = zip(*USPS_data)
+    # USPS_data_train = USPS("./", train = True, download = True)
+    # USPS_data_test = USPS("./", train = False, download = True)
+    # USPS_data = ConcatDataset([USPS_data_test, USPS_data_train])
+    # X, y = zip(*USPS_data)
 
-    y_numpy = np.array(y[:n])
-    X_numpy = np.array([np.asarray(X[i]) for i in range(n if n is not None else len(X))])
-    X = torch.Tensor(X_numpy).unsqueeze(1)
+    # y_numpy = np.array(y[:n])
+    # X_numpy = np.array([np.asarray(X[i]) for i in range(n if n is not None else len(X))])
+    # X = torch.Tensor(X_numpy).unsqueeze(1)
 
-    which = np.random.choice(len(y_numpy), int((1-semisupervised_proportion)*len(y_numpy)), replace = False)
+    # which = np.random.choice(len(y_numpy), int((1-semisupervised_proportion)*len(y_numpy)), replace = False)
+    # y_for_verification = copy.deepcopy(y_numpy)
+    # y_numpy[which] = -1
+
+    news_train, news_test = AG_NEWS('./', ngrams = 1)
+    X, y = zip(*([item[1], item[0]] for item in news_test))
+    X = X[:n]
+    y = y[:n]
+    y_numpy = np.array(y)
     y_for_verification = copy.deepcopy(y_numpy)
-    y_numpy[which] = -1
 
-    # news_train, news_test = AG_NEWS('./', ngrams = 1)
-    # X, y = zip(*([item[1], item[0]] for item in news_test))
-    # X = X[:n]
-    # y = y[:n]
-    # y_numpy = np.array(y)
+    # X_numpy = np.load("shekhar_data_pca_40.npy")[:n]
+    # y_numpy_strs = np.load("shekhar_labels.npy", allow_pickle = True)[:n]
+    # str_to_ind = {name:i for i, name in enumerate(np.unique(y_numpy_strs))}
+    # y_numpy = np.array([str_to_ind[name] for name in y_numpy_strs])
+    # X = torch.Tensor(X_numpy)
+    # which = y_numpy < 16 # to just focus on interesting stuff
+    # X = X[which]
+    # y_numpy = y_numpy[which]
     # y_for_verification = copy.deepcopy(y_numpy)
 
-    e.fit(X, y_numpy, y_for_verification = y_for_verification, plot = False)
-    # e.find_differentiating_features(X[0], X)
-    e.summerize_differentiating_features(X)
+    e.fit(X, y_numpy, y_for_verification = y_for_verification, plot = True)
+    # e.save("test_thing.pt")
+    # e.load("test_thing.pt")
+    # # e.find_differentiating_features(X[0], X)
+    # e.summerize_differentiating_features(X)
